@@ -8,6 +8,7 @@ import math
 from sincfold.metrics import contact_f1
 from sincfold.utils import mat2bp, postprocessing
 from sincfold._version import __version__
+from torch.cuda.amp import autocast, GradScaler
 
 SINCFOLD_WEIGHTS = f'https://github.com/sinc-lab/sincFold/raw/main/weights/sincFold_weights_{__version__}.pmt'
 
@@ -44,10 +45,13 @@ class SincFold(nn.Module):
         verbose=True,
         interaction_prior=False,
         output_th=0.5,
+        use_amp=None,
         **kwargs
     ):
         """Base classifier model from embedding sequence-
-        negative_weigth: not_conected/conected proportion in error weights."""
+        negative_weigth: not_conected/conected proportion in error weights.
+        use_amp: Enable automatic mixed precision (default: auto-enable on CUDA, disable on CPU)
+        """
         super().__init__()
 
         self.device = device
@@ -57,6 +61,15 @@ class SincFold(nn.Module):
         self.verbose = verbose
         self.config = kwargs
         self.output_th = output_th
+
+        # Enable automatic mixed precision - auto-enable on CUDA unless user specifies otherwise
+        if use_amp is None:
+            self.use_amp = device == "cuda"
+        else:
+            self.use_amp = use_amp
+            
+        if self.use_amp:
+            self.scaler = GradScaler()
 
         mid_ch = 1
         self.interaction_prior = interaction_prior
@@ -169,17 +182,15 @@ class SincFold(nn.Module):
 
         yb = self.convrank2(y)
 
-        y = ya @ yb
-        yt = tr.transpose(y, -1, -2)
-        y = (y + yt) / 2
-
-        y0 = y.view(-1, L, L) 
+        # Efficient matmul with symmetrization
+        y = tr.matmul(ya, yb)
+        y = (y + y.transpose(-1, -2)) * 0.5
+        y0 = y.view(-1, L, L)
 
         if self.interaction_prior != "none":
             prob_mat = batch["interaction_prior"].to(self.device)
-            x1 = tr.zeros([batch_size, 2, L, L]).to(self.device)
-            x1[:, 0, :, :] = y0
-            x1[:, 1, :, :] = prob_mat
+            # Fused stack operation
+            x1 = tr.stack([y0, prob_mat], dim=1)
         else:
             x1 = y0.unsqueeze(1)
 
@@ -188,8 +199,8 @@ class SincFold(nn.Module):
         y = self.conv2Dout(tr.relu(y)).squeeze(1)
         if batch["canonical_mask"] is not None:
             y = y.multiply(batch["canonical_mask"].to(self.device))
-        yt = tr.transpose(y, -1, -2)
-        y = (y + yt) / 2
+        # Symmetrize output
+        y = (y + y.transpose(-1, -2)) * 0.5
 
         return y, y0
 
@@ -198,23 +209,19 @@ class SincFold(nn.Module):
         y = y.view(y.shape[0], -1)
         yhat, y0 = yhat  # yhat is the final ouput and y0 is the cnn output
 
-        yhat = yhat.view(yhat.shape[0], -1)
-        y0 = y0.view(y0.shape[0], -1)
+        yhat_flat = yhat.view(yhat.shape[0], -1)
+        y0_flat = y0.view(y0.shape[0], -1)
 
         # Add l1 loss, ignoring the padding
-        l1_loss = tr.mean(tr.relu(yhat[y != -1]))
+        mask = y != -1
+        l1_loss = tr.mean(tr.relu(yhat_flat[mask]))
 
-        # yhat has to be shape [N, 2, L].
-        yhat = yhat.unsqueeze(1)
-        # yhat will have high positive values for base paired and high negative values for unpaired
-        yhat = tr.cat((-yhat, yhat), dim=1)
+        # Prepare for cross entropy - fused stack
+        yhat_ce = tr.stack((-yhat_flat, yhat_flat), dim=1)
+        y0_ce = tr.stack((-y0_flat, y0_flat), dim=1)
         
-        y0 = y0.unsqueeze(1)
-        y0 = tr.cat((-y0, y0), dim=1)
-        error_loss1 = cross_entropy(y0, y, ignore_index=-1, weight=self.class_weight)
-        
-        error_loss = cross_entropy(yhat, y, ignore_index=-1, weight=self.class_weight)
-    
+        error_loss1 = cross_entropy(y0_ce, y, ignore_index=-1, weight=self.class_weight)
+        error_loss = cross_entropy(yhat_ce, y, ignore_index=-1, weight=self.class_weight)
 
         loss = (
             error_loss
@@ -234,10 +241,23 @@ class SincFold(nn.Module):
             
             y = batch["contact"].to(self.device)
             batch.pop("contact")
-            self.optimizer.zero_grad()  # Cleaning cache optimizer
-            y_pred = self(batch)
+            self.optimizer.zero_grad(set_to_none=True)  # More efficient
             
-            loss = self.loss_func(y_pred, y)
+            # Use mixed precision if available
+            if self.use_amp:
+                with autocast():
+                    y_pred = self(batch)
+                    loss = self.loss_func(y_pred, y)
+                
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                y_pred = self(batch)
+                loss = self.loss_func(y_pred, y)
+                loss.backward()
+                self.optimizer.step()
+            
             # y_pred is a composed tensor, we need to get the final pred
             if isinstance(y_pred, tuple):
                 y_pred = y_pred[0]
@@ -248,9 +268,6 @@ class SincFold(nn.Module):
 
             metrics["loss"] += loss.item()
             metrics["f1"] += f1
-
-            loss.backward()
-            self.optimizer.step()
 
             if self.scheduler_name == "cycle":
                     self.scheduler.step()
@@ -273,15 +290,23 @@ class SincFold(nn.Module):
                 batch.pop("contact")
                 lengths = batch["length"]
                 
-
-                y_pred = self(batch)
-                loss = self.loss_func(y_pred, y)
+                # Use mixed precision for inference
+                if self.use_amp:
+                    with autocast():
+                        y_pred = self(batch)
+                        loss = self.loss_func(y_pred, y)
+                else:
+                    y_pred = self(batch)
+                    loss = self.loss_func(y_pred, y)
+                    
                 metrics["loss"] += loss.item()
 
                 if isinstance(y_pred, tuple):
                     y_pred = y_pred[0]
 
-                y_pred_post = postprocessing(y_pred.cpu(), batch["canonical_mask"])
+                # Keep on GPU for vectorized postprocessing
+                canonical_mask_device = batch["canonical_mask"].to(self.device) if batch["canonical_mask"] is not None else None
+                y_pred_post = postprocessing(y_pred, canonical_mask_device)
 
                 f1 = contact_f1(y.cpu(), y_pred.cpu(), lengths, th=self.output_th, reduce=True, method="triangular")
                 f1_post = contact_f1(
@@ -312,27 +337,34 @@ class SincFold(nn.Module):
                 seqid = batch["id"]
                 sequences = batch["sequence"]
 
+                # Use mixed precision for inference
+                if self.use_amp:
+                    with autocast():
+                        y_pred = self(batch)
+                else:
+                    y_pred = self(batch)
 
-                y_pred = self(batch)
-                
                 if isinstance(y_pred, tuple):
                     y_pred = y_pred[0]
 
-                y_pred_post = postprocessing(y_pred.cpu(), batch["canonical_mask"])
+                # Keep everything on GPU - vectorized postprocessing is efficient!
+                canonical_mask_device = batch["canonical_mask"].to(self.device) if batch["canonical_mask"] is not None else None
+                y_pred_post = postprocessing(y_pred, canonical_mask_device)
 
                 for k in range(y_pred_post.shape[0]):
+                    # Only transfer small slices to CPU at the end
+                    y_pred_slice = y_pred_post[k, : lengths[k], : lengths[k]].squeeze().cpu()
+
                     if logits:
                         logits_list.append(
                             (seqid[k],
                              y_pred[k, : lengths[k], : lengths[k]].squeeze().cpu(),
-                             y_pred_post[k, : lengths[k], : lengths[k]].squeeze()
+                             y_pred_slice
                             ))
                     predictions.append(
                         (seqid[k],
                         sequences[k],
-                            mat2bp(
-                                y_pred_post[k, : lengths[k], : lengths[k]].squeeze()
-                            )                         
+                            mat2bp(y_pred_slice)
                         )
                     )
         predictions = pd.DataFrame(predictions, columns=["id", "sequence", "base_pairs"])
@@ -353,7 +385,7 @@ class ResidualLayer1D(nn.Module):
 
         self.layer = nn.Sequential(
             nn.BatchNorm1d(filters),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),  # In-place for memory efficiency
             nn.Conv1d(
                 filters,
                 num_bottleneck_units,
@@ -362,7 +394,7 @@ class ResidualLayer1D(nn.Module):
                 padding="same",
             ),
             nn.BatchNorm1d(num_bottleneck_units),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),  # In-place for memory efficiency
             nn.Conv1d(num_bottleneck_units, filters, kernel_size=1, padding="same"),
         )
 
@@ -375,10 +407,10 @@ class ResidualBlock2D(nn.Module):
         super().__init__()
         self.layer = nn.Sequential(
             nn.BatchNorm2d(filters),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),  # In-place for memory efficiency
             nn.Conv2d(filters, filters1, kernel_size, padding="same"),
             nn.BatchNorm2d(filters1),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),  # In-place for memory efficiency
             nn.Conv2d(
                 filters1, filters, kernel_size, dilation=dilation, padding="same"
             ),
