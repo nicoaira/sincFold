@@ -7,6 +7,7 @@ from datetime import datetime
 import pandas as pd
 import shutil
 import pickle
+import tempfile
 
 from torch.utils.data import DataLoader
 from sincfold.dataset import SeqDataset, pad_batch
@@ -232,16 +233,23 @@ def pred(pred_input, sequence_id='pred_id', model_weights=None, out_path=None, l
     if draw:
         for i in range(len(predictions)):
             item = predictions.iloc[i]
-            ctfile = "tmp.ct"
-            write_ct(ctfile, item.id, item.sequence, item.base_pairs)
-            dotbracket = ct2dot(ctfile)
-            
-            png_file = item.id +".png"
-            if out_path is not None and os.path.isdir(out_path):
-                png_file = os.path.join(out_path, png_file)
-            if dotbracket:
-                dot2png(png_file, item.sequence, dotbracket, resolution=draw_resolution)
-            ct2svg("tmp.ct", png_file.replace(".png", ".svg"))
+            with tempfile.NamedTemporaryFile(suffix=".ct", delete=False) as tmp_ct:
+                ctfile = tmp_ct.name
+            try:
+                write_ct(ctfile, item.id, item.sequence, item.base_pairs)
+                dotbracket = ct2dot(ctfile)
+
+                png_file = item.id + ".png"
+                if out_path is not None and os.path.isdir(out_path):
+                    png_file = os.path.join(out_path, png_file)
+                if dotbracket:
+                    dot2png(png_file, item.sequence, dotbracket, resolution=draw_resolution)
+                ct2svg(ctfile, png_file.replace(".png", ".svg"))
+            finally:
+                try:
+                    os.remove(ctfile)
+                except FileNotFoundError:
+                    pass
 
     if not file_input:
         os.remove(pred_file)
@@ -249,9 +257,16 @@ def pred(pred_input, sequence_id='pred_id', model_weights=None, out_path=None, l
     if output_format == "text":
         for i in range(len(predictions)):
             item = predictions.iloc[i]
-            ctfile = "tmp.ct"
-            write_ct(ctfile, item.id, item.sequence, item.base_pairs)
-            dotbracket = ct2dot(ctfile)
+            with tempfile.NamedTemporaryFile(suffix=".ct", delete=False) as tmp_ct:
+                ctfile = tmp_ct.name
+            try:
+                write_ct(ctfile, item.id, item.sequence, item.base_pairs)
+                dotbracket = ct2dot(ctfile)
+            finally:
+                try:
+                    os.remove(ctfile)
+                except FileNotFoundError:
+                    pass
             print(item.id)
             print(item.sequence)
             print(dotbracket)
