@@ -28,6 +28,10 @@ def main():
     config= {"device": args.d, "batch_size": args.batch, 
              "valid_split": 0.1, "max_len": args.max_length, "verbose": not args.quiet, "cache_path": cache_path}
     
+    # Handle mixed precision flag
+    if args.no_amp:
+        config["use_amp"] = False
+    
     if "max_epochs" in args:
         config["max_epochs"] = args.max_epochs
 
