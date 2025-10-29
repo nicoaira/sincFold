@@ -314,28 +314,50 @@ def mat2bp(x):
 
 
 def postprocessing(preds, masks):
-    """Postprocessing function using viable pairing mask.
-    Inputs are batches of size [B, N, N]"""
+    """Vectorized postprocessing function using viable pairing mask.
+    Inputs are batches of size [B, N, N].
+
+    Fully vectorized - no Python loop! Processes all batch elements simultaneously.
+    This allows keeping tensors on GPU without transfer overhead.
+    """
     if masks is not None:
         preds = preds.multiply(masks)
 
+    B, N, _ = preds.shape
+    device = preds.device
+
     y_pred_mask_triu = tr.triu(preds)
     y_pred_mask_max = tr.zeros_like(preds)
-    for k in range(preds.shape[0]):
-        y_pred_mask_max_aux = tr.zeros_like(y_pred_mask_triu[k, :, :])
 
-        val, ind = y_pred_mask_triu[k, :, :].max(dim=0)
-        y_pred_mask_max[k, ind[val > 0], val > 0] = val[val > 0]
+    # For each column (dim=1), find row index with max value across all batches
+    # Shape: val [B, N], ind [B, N]
+    val_col, ind_col = y_pred_mask_triu.max(dim=1)
 
-        val, ind = y_pred_mask_max[k, :, :].max(dim=1)
-        y_pred_mask_max_aux[val > 0, ind[val > 0]] = val[val > 0]
+    # Create indices for advanced indexing
+    batch_idx = tr.arange(B, device=device).view(B, 1).expand(B, N)
+    col_idx = tr.arange(N, device=device).view(1, N).expand(B, N)
 
-        ind = tr.where(y_pred_mask_max[k, :, :] != y_pred_mask_max_aux)
-        y_pred_mask_max[k, ind[0], ind[1]] = 0
+    # Set values where val > 0
+    mask_col = val_col > 0
+    y_pred_mask_max[batch_idx[mask_col], ind_col[mask_col], col_idx[mask_col]] = val_col[mask_col]
 
-        y_pred_mask_max[k] = tr.triu(y_pred_mask_max[k]) + tr.triu(
-            y_pred_mask_max[k]
-        ).transpose(0, 1)
+    # For each row (dim=2), find column index with max value
+    val_row, ind_row = y_pred_mask_max.max(dim=2)
+
+    # Create auxiliary matrix
+    y_pred_mask_max_aux = tr.zeros_like(preds)
+
+    # Set values where val > 0
+    row_idx = tr.arange(N, device=device).view(1, N).expand(B, N)
+    mask_row = val_row > 0
+    y_pred_mask_max_aux[batch_idx[mask_row], row_idx[mask_row], ind_row[mask_row]] = val_row[mask_row]
+
+    # Zero out positions where they don't match
+    y_pred_mask_max[y_pred_mask_max != y_pred_mask_max_aux] = 0
+
+    # Make symmetric
+    y_pred_mask_max = tr.triu(y_pred_mask_max) + tr.triu(y_pred_mask_max).transpose(1, 2)
+
     return y_pred_mask_max
 
 def find_pseudoknots(base_pairs):
