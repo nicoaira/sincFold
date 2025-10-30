@@ -6,7 +6,7 @@ import pandas as pd
 import math
 
 from sincfold.metrics import contact_f1
-from sincfold.utils import mat2bp, postprocessing
+from sincfold.utils import mat2bp, postprocessing, fold_with_vienna
 from sincfold._version import __version__
 from torch.cuda.amp import autocast, GradScaler
 
@@ -323,7 +323,7 @@ class SincFold(nn.Module):
 
         return metrics
 
-    def pred(self, loader, logits=False):
+    def pred(self, loader, logits=False, use_vienna=False, vienna_weight=1.0, vienna_temp=37.0, vienna_linear=False):
         self.eval()
 
         if self.verbose:
@@ -347,27 +347,62 @@ class SincFold(nn.Module):
                 if isinstance(y_pred, tuple):
                     y_pred = y_pred[0]
 
-                # Keep everything on GPU - vectorized postprocessing is efficient!
-                canonical_mask_device = batch["canonical_mask"].to(self.device) if batch["canonical_mask"] is not None else None
-                y_pred_post = postprocessing(y_pred, canonical_mask_device)
+                if use_vienna:
+                    # Use ViennaRNA for folding with soft constraints
+                    for k in range(y_pred.shape[0]):
+                        # Get probability matrix for this sequence
+                        y_pred_slice = y_pred[k, : lengths[k], : lengths[k]].squeeze().cpu()
 
-                for k in range(y_pred_post.shape[0]):
-                    # Only transfer small slices to CPU at the end
-                    y_pred_slice = y_pred_post[k, : lengths[k], : lengths[k]].squeeze().cpu()
+                        if logits:
+                            logits_list.append(
+                                (seqid[k],
+                                 y_pred_slice,
+                                 None  # No postprocessed matrix when using ViennaRNA
+                                ))
 
-                    if logits:
-                        logits_list.append(
-                            (seqid[k],
-                             y_pred[k, : lengths[k], : lengths[k]].squeeze().cpu(),
-                             y_pred_slice
-                            ))
-                    predictions.append(
-                        (seqid[k],
-                        sequences[k],
-                            mat2bp(y_pred_slice)
+                        # Fold with ViennaRNA
+                        base_pairs, mfe_energy = fold_with_vienna(
+                            sequences[k],
+                            y_pred_slice,
+                            weight=vienna_weight,
+                            temperature=vienna_temp,
+                            linear=vienna_linear
                         )
-                    )
-        predictions = pd.DataFrame(predictions, columns=["id", "sequence", "base_pairs"])
+
+                        predictions.append(
+                            (seqid[k],
+                             sequences[k],
+                             base_pairs,
+                             mfe_energy)
+                        )
+                else:
+                    # Original sincFold postprocessing + mat2bp
+                    # Keep everything on GPU - vectorized postprocessing is efficient!
+                    canonical_mask_device = batch["canonical_mask"].to(self.device) if batch["canonical_mask"] is not None else None
+                    y_pred_post = postprocessing(y_pred, canonical_mask_device)
+
+                    for k in range(y_pred_post.shape[0]):
+                        # Only transfer small slices to CPU at the end
+                        y_pred_slice = y_pred_post[k, : lengths[k], : lengths[k]].squeeze().cpu()
+
+                        if logits:
+                            logits_list.append(
+                                (seqid[k],
+                                 y_pred[k, : lengths[k], : lengths[k]].squeeze().cpu(),
+                                 y_pred_slice
+                                ))
+                        predictions.append(
+                            (seqid[k],
+                             sequences[k],
+                             mat2bp(y_pred_slice),
+                             None)  # No MFE when not using ViennaRNA
+                        )
+
+        # Create DataFrame with MFE column
+        if use_vienna:
+            predictions = pd.DataFrame(predictions, columns=["id", "sequence", "base_pairs", "mfe"])
+        else:
+            predictions = pd.DataFrame(predictions, columns=["id", "sequence", "base_pairs", "mfe"])
 
         return predictions, logits_list
 

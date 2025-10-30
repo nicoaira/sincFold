@@ -12,6 +12,12 @@ from sincfold.embeddings import NT_DICT
 from sincfold import __path__ as sincfold_path
 from sincfold.embeddings import NT_DICT, VOCABULARY
 
+try:
+    import RNA
+    VIENNA_AVAILABLE = True
+except ImportError:
+    VIENNA_AVAILABLE = False
+
 
 CT2DOT_CALL = f"export DATAPATH={sincfold_path[0]}/tools/RNAstructure/data_tables; {sincfold_path[0]}/tools/RNAstructure/ct2dot"
 DRAW_CALL = f"export DATAPATH={sincfold_path[0]}/tools/RNAstructure/data_tables;  {sincfold_path[0]}/tools/RNAstructure/draw -c -u --svg -n 1"
@@ -359,6 +365,133 @@ def postprocessing(preds, masks):
     y_pred_mask_max = tr.triu(y_pred_mask_max) + tr.triu(y_pred_mask_max).transpose(1, 2)
 
     return y_pred_mask_max
+
+
+def fold_with_vienna(sequence, probability_matrix, weight=1.0, temperature=37.0, linear=False, prob_threshold=0.1, max_constraints=None):
+    """
+    Fold RNA sequence using ViennaRNA with soft constraints from sincFold probability matrix.
+
+    Args:
+        sequence (str): RNA sequence
+        probability_matrix (torch.Tensor): [N, N] contact probability matrix from sincFold
+        weight (float): Scaling factor for soft constraints (default: 1.0)
+        temperature (float): Folding temperature in Celsius (default: 37.0)
+        linear (bool): If True, use linear scaling E = -w*P; if False, use pseudo-free-energy E = -w*ln(P) (default: False)
+        prob_threshold (float): Only apply constraints for probabilities above this threshold (default: 0.1)
+        max_constraints (int): Maximum number of constraints to apply (default: None, uses N*2)
+
+    Returns:
+        tuple: (base_pairs, mfe_energy)
+            - base_pairs: List of 1-indexed base pairs [[i, j], ...]
+            - mfe_energy: MFE in kcal/mol
+    """
+    if not VIENNA_AVAILABLE:
+        raise ImportError(
+            "ViennaRNA is not installed. Please install it to use --use-vienna flag. "
+            "Installation: conda install -c bioconda viennarna OR pip install ViennaRNA"
+        )
+
+    # Prepare sequence for ViennaRNA (replace T with U)
+    sequence_rna = sequence.upper().replace('T', 'U')
+    N = len(sequence_rna)
+
+    # Validate sequence length
+    if N == 0:
+        return [], 0.0
+
+    # Convert probability matrix to numpy if it's a tensor
+    if isinstance(probability_matrix, tr.Tensor):
+        prob_matrix = probability_matrix.cpu().numpy()
+    else:
+        prob_matrix = np.array(probability_matrix)
+
+    # Validate matrix shape
+    if prob_matrix.shape[0] != N or prob_matrix.shape[1] != N:
+        raise ValueError(f"Probability matrix shape {prob_matrix.shape} doesn't match sequence length {N}")
+
+    # Check for NaN or Inf values
+    if np.any(np.isnan(prob_matrix)) or np.any(np.isinf(prob_matrix)):
+        warnings.warn(f"Probability matrix contains NaN or Inf values, replacing with 0")
+        prob_matrix = np.nan_to_num(prob_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Clip probabilities to valid range
+    prob_matrix = np.clip(prob_matrix, 0.0, 1.0)
+
+    # Create fold compound - use global temperature setting
+    # Some versions of ViennaRNA have issues with md object
+    RNA.cvar.temperature = temperature
+    fc = RNA.fold_compound(sequence_rna)
+
+    epsilon = 1e-10  # Small value to avoid log(0)
+    max_energy = 100.0  # Cap energy values to avoid extreme values
+    min_energy = 0.1  # Minimum absolute energy value to avoid numerical issues
+
+    # Set default max_constraints if not provided
+    if max_constraints is None:
+        max_constraints = N * 2  # Reasonable default: 2 constraints per nucleotide
+
+    # Collect all potential constraints
+    constraints = []
+    for i in range(N):
+        for j in range(i + 1, N):  # Only upper triangle
+            prob = float(prob_matrix[i, j])
+
+            if prob > prob_threshold:
+                constraints.append((i, j, prob))
+
+    # Sort by probability (descending) and take top max_constraints
+    constraints = sorted(constraints, key=lambda x: x[2], reverse=True)[:max_constraints]
+
+    # Apply soft constraints for base pairs
+    # ViennaRNA uses 1-based indexing
+    constraint_count = 0
+    for i, j, prob in constraints:
+        # Convert probability to energy bonus
+        # High probability = more favorable = more negative energy
+        if linear:
+            # Linear scaling: E = -w * P
+            # High P (e.g., 0.9) → E = -0.9*w (negative/favorable)
+            energy = -weight * prob
+        else:
+            # Pseudo-free-energy: scale probability and use log
+            # High P → more negative energy
+            # Use: E = weight * log(1 - P) for high P to give negative energy
+            # But clamp P to avoid log(0)
+            prob_clamped = min(prob, 0.9999)
+            energy = weight * np.log(1.0 - prob_clamped + epsilon)
+
+        # Clip energy to reasonable range
+        energy = float(np.clip(energy, -max_energy, max_energy))
+
+        # Skip if energy magnitude is too small (can cause numerical issues)
+        if abs(energy) < min_energy:
+            continue
+
+        # Add soft constraint (1-indexed for ViennaRNA)
+        # Negative energy = favorable = bonus
+        try:
+            fc.sc_add_bp(i + 1, j + 1, energy)
+            constraint_count += 1
+        except Exception as e:
+            warnings.warn(f"Failed to add constraint for pair ({i+1}, {j+1}): {e}")
+            continue
+
+    # Perform MFE folding
+    try:
+        structure, mfe = fc.mfe()
+    except Exception as e:
+        warnings.warn(f"ViennaRNA folding failed for sequence length {N}: {e}. Returning empty structure.")
+        return [], 0.0
+
+    # Parse structure to base pairs
+    base_pairs = dot2bp(structure)
+
+    # If parsing failed, return empty list
+    if base_pairs is False:
+        base_pairs = []
+
+    return base_pairs, float(mfe)
+
 
 def find_pseudoknots(base_pairs):
     pseudoknots = []

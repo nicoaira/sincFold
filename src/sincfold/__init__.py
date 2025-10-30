@@ -55,7 +55,15 @@ def main():
         test(args.test_file, args.model_weights, args.out_path, config, args.j)
 
     if args.command == "pred":
-        pred(args.pred_file, model_weights=args.model_weights, out_path=args.out_path, logits=args.logits, config=config, nworkers=args.j, draw=args.draw, draw_resolution=args.draw_resolution)    
+        # Extract ViennaRNA parameters if present
+        use_vienna = args.use_vienna if hasattr(args, 'use_vienna') else False
+        vienna_weight = args.vienna_weight if hasattr(args, 'vienna_weight') else 1.0
+        vienna_temp = args.vienna_temp if hasattr(args, 'vienna_temp') else 37.0
+        vienna_linear = args.vienna_linear if hasattr(args, 'vienna_linear') else False
+
+        pred(args.pred_file, model_weights=args.model_weights, out_path=args.out_path, logits=args.logits,
+             config=config, nworkers=args.j, draw=args.draw, draw_resolution=args.draw_resolution,
+             use_vienna=use_vienna, vienna_weight=vienna_weight, vienna_temp=vienna_temp, vienna_linear=vienna_linear)    
         
 def train(train_file, config={}, out_path=None, valid_file=None, nworkers=2, verbose=True):
     
@@ -182,7 +190,7 @@ def test(test_file, model_weights=None, output_file=None, config={}, nworkers=2,
     if verbose:
         print(summary)
 
-def pred(pred_input, sequence_id='pred_id', model_weights=None, out_path=None, logits=False, config={}, nworkers=2, draw=False, draw_resolution=10, verbose=True):
+def pred(pred_input, sequence_id='pred_id', model_weights=None, out_path=None, logits=False, config={}, nworkers=2, draw=False, draw_resolution=10, verbose=True, use_vienna=False, vienna_weight=1.0, vienna_temp=37.0, vienna_linear=False):
     
     if out_path is None:
         output_format = "text"
@@ -226,10 +234,12 @@ def pred(pred_input, sequence_id='pred_id', model_weights=None, out_path=None, l
     else:
         net = sincfold(pretrained=True, **config)
 
-    if verbose:        
+    if verbose:
         print(f"Start prediction of {pred_file}")
 
-    predictions, logits_list = net.pred(pred_loader, logits=logits)
+    predictions, logits_list = net.pred(pred_loader, logits=logits, use_vienna=use_vienna,
+                                        vienna_weight=vienna_weight, vienna_temp=vienna_temp,
+                                        vienna_linear=vienna_linear)
     if draw:
         for i in range(len(predictions)):
             item = predictions.iloc[i]

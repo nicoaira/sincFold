@@ -95,8 +95,13 @@ def parser():
         "-w", type=str, dest="model_weights", help="Trained model weights"
     )
 
-    parser_pred.add_argument("--draw", action="store_true", help="Draw structure (default: False)") 
-    parser_pred.add_argument("--draw-resolution", default=5, help="Drawing resolution (default: 5 times the base)") 
+    parser_pred.add_argument("--draw", action="store_true", help="Draw structure (default: False)")
+    parser_pred.add_argument("--draw-resolution", default=5, help="Drawing resolution (default: 5 times the base)")
+
+    parser_pred.add_argument("--use-vienna", action="store_true", help="Use ViennaRNA for thermodynamic folding with soft constraints from sincFold probabilities (default: False)")
+    parser_pred.add_argument("--vienna-weight", type=float, default=1.0, help="Weight for soft constraints (default: 1.0)")
+    parser_pred.add_argument("--vienna-temp", type=float, default=37.0, help="Folding temperature in Celsius (default: 37.0)")
+    parser_pred.add_argument("--vienna-linear", action="store_true", help="Use linear scaling (E = -w*P) instead of pseudo-free-energy (E = -w*ln(P)) for constraints (default: False)")
 
     return parser.parse_args()
     
