@@ -1,5 +1,28 @@
 # **sincFold**
 
+> **⚠️ EXPERIMENTAL FORK WARNING**
+> 
+> This is an **experimental fork** of sincFold with custom modifications for performance testing.
+> 
+> **For production use, please use the original, tested repository:** https://github.com/sinc-lab/sincFold
+>
+> ### Mixed Precision Mode Results
+> 
+> This fork includes experimental mixed precision (FP16) support. Preliminary testing shows high accuracy compared to full precision (FP32), but **use with caution**:
+>
+> | Metric | Value |
+> |--------|-------|
+> | **Average F1 Score** | **99.88%** |
+> | Average Precision | 99.96% |
+> | Average Recall | 99.81% |
+> | Perfect Matches | 100/121 sequences (82.6%) |
+> | Sequences with Differences | 21/121 sequences (17.4%) |
+> | Total Different Base Pairs | 25 out 84,680 |
+> | Min F1 Score | 97.30% |
+> | Max F1 Score | 100.00% |
+>
+> *F1 scores calculated by comparing mixed precision predictions against full precision ground truth on a test set of 121 long (from 400 to 1400 nt long) RNA sequences.*
+
 This is the repository for sincFold, a new RNA secondary folding prediction tool based on deep learning.
 [Check out the paper!](https://academic.oup.com/bib/article/25/4/bbae271/7690295)
 
