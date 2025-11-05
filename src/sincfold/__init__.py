@@ -17,7 +17,7 @@ from sincfold.utils import write_ct, validate_file, ct2dot
 from sincfold.parser import parser
 from sincfold.utils import dot2png, ct2svg
 
-def setup_cpu_inference(device, num_workers, verbose=False):
+def setup_cpu_inference(device, num_workers=None, inference_threads=None, verbose=False):
     """
     Configure CPU threading for optimal inference performance.
 
@@ -26,14 +26,22 @@ def setup_cpu_inference(device, num_workers, verbose=False):
 
     Args:
         device: Device type ('cpu' or 'cuda')
-        num_workers: Number of DataLoader workers
+        num_workers: Number of DataLoader workers (optional, will be calculated if not provided)
+        inference_threads: Number of inference threads (optional, will be calculated if not provided)
         verbose: Print threading configuration
     """
     if device == "cpu":
         cpu_count = os.cpu_count() or 4
 
-        # Reserve cores for DataLoader workers, use rest for inference
-        intra_threads = max(1, cpu_count - num_workers)
+        # If inference_threads is explicitly provided, use it
+        if inference_threads is not None:
+            intra_threads = inference_threads
+        elif num_workers is not None:
+            # Calculate from num_workers
+            intra_threads = max(1, cpu_count - num_workers)
+        else:
+            # Default: use all available cores
+            intra_threads = cpu_count
 
         # Set PyTorch internal threading
         tr.set_num_threads(intra_threads)
@@ -44,7 +52,8 @@ def setup_cpu_inference(device, num_workers, verbose=False):
         os.environ.setdefault("OPENBLAS_NUM_THREADS", str(intra_threads))
 
         if verbose:
-            print(f"CPU threading configured: {intra_threads} threads for inference, {num_workers} workers for data loading")
+            workers_str = f"{num_workers} workers" if num_workers is not None else "auto workers"
+            print(f"CPU threading configured: {intra_threads} threads for inference, {workers_str} for data loading")
 
 def main():
     
