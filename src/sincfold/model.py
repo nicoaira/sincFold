@@ -34,8 +34,11 @@ def sincfold(pretrained=False, weights=None, compile_model=False, **kwargs):
     if compile_model:
         try:
             print("Compiling model with torch.compile() for faster inference...")
-            model = tr.compile(model, mode="reduce-overhead")
-            print("Model compilation successful")
+            # Use 'default' mode instead of 'reduce-overhead' to avoid CUDA graph issues
+            # with dynamic shapes (variable sequence lengths). 'default' mode provides
+            # good speedup without requiring static shapes.
+            model = tr.compile(model, mode="default", dynamic=True)
+            print("Model compilation successful (dynamic shapes enabled)")
         except Exception as e:
             print(f"Warning: Model compilation failed ({e}), falling back to eager mode")
 
