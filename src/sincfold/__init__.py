@@ -17,6 +17,35 @@ from sincfold.utils import write_ct, validate_file, ct2dot
 from sincfold.parser import parser
 from sincfold.utils import dot2png, ct2svg
 
+def setup_cpu_inference(device, num_workers, verbose=False):
+    """
+    Configure CPU threading for optimal inference performance.
+
+    For CPU inference, this sets the number of threads used by PyTorch's
+    backend libraries (MKL/OpenBLAS) to avoid thread oversubscription.
+
+    Args:
+        device: Device type ('cpu' or 'cuda')
+        num_workers: Number of DataLoader workers
+        verbose: Print threading configuration
+    """
+    if device == "cpu":
+        cpu_count = os.cpu_count() or 4
+
+        # Reserve cores for DataLoader workers, use rest for inference
+        intra_threads = max(1, cpu_count - num_workers)
+
+        # Set PyTorch internal threading
+        tr.set_num_threads(intra_threads)
+
+        # Set backend threading libraries
+        os.environ.setdefault("OMP_NUM_THREADS", str(intra_threads))
+        os.environ.setdefault("MKL_NUM_THREADS", str(intra_threads))
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", str(intra_threads))
+
+        if verbose:
+            print(f"CPU threading configured: {intra_threads} threads for inference, {num_workers} workers for data loading")
+
 def main():
     
     args = parser()
@@ -26,12 +55,15 @@ def main():
     else:
         cache_path = None
 
-    config= {"device": args.d, "batch_size": args.batch, 
+    config= {"device": args.d, "batch_size": args.batch,
              "valid_split": 0.1, "max_len": args.max_length, "verbose": not args.quiet, "cache_path": cache_path}
-    
+
     # Handle mixed precision flag
     if args.no_amp:
         config["use_amp"] = False
+
+    # Handle model compilation flag
+    config["compile_model"] = args.compile
     
     if "max_epochs" in args:
         config["max_epochs"] = args.max_epochs
@@ -220,6 +252,11 @@ def pred(pred_input, sequence_id='pred_id', model_weights=None, out_path=None, l
             
         else:
             raise ValueError(f"Invalid input nt {set(pred_input)}, either the file is missing or the secuence have invalid nucleotides (should be any of {nt_set})")
+
+    # Configure CPU threading for optimal performance
+    device = config.get("device", "cpu")
+    setup_cpu_inference(device, nworkers, verbose=config.get("verbose", verbose))
+
     pred_loader = DataLoader(
         SeqDataset(pred_file, for_prediction=True, **config),
         batch_size=config["batch_size"] if "batch_size" in config else 4,

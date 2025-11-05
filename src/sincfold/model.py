@@ -12,10 +12,11 @@ from torch.cuda.amp import autocast, GradScaler
 
 SINCFOLD_WEIGHTS = f'https://github.com/sinc-lab/sincFold/raw/main/weights/sincFold_weights_{__version__}.pmt'
 
-def sincfold(pretrained=False, weights=None, **kwargs):
-    """ 
+def sincfold(pretrained=False, weights=None, compile_model=False, **kwargs):
+    """
     SincFold: a deep learning-based model for RNA secondary structure prediction
     pretrained (bool): Use pretrained weights
+    compile_model (bool): Compile model with torch.compile() for faster inference (PyTorch 2.x)
     **kwargs: Model hyperparameters
     """
     model = SincFold(**kwargs)
@@ -28,7 +29,16 @@ def sincfold(pretrained=False, weights=None, **kwargs):
             model.load_state_dict(tr.load(weights, map_location=tr.device(model.device)))
         else:
             print("No weights provided, using random initialization")
-        
+
+    # Compile model for inference speedup (PyTorch 2.x)
+    if compile_model:
+        try:
+            print("Compiling model with torch.compile() for faster inference...")
+            model = tr.compile(model, mode="reduce-overhead")
+            print("Model compilation successful")
+        except Exception as e:
+            print(f"Warning: Model compilation failed ({e}), falling back to eager mode")
+
     return model
 
 class SincFold(nn.Module):
@@ -329,8 +339,8 @@ class SincFold(nn.Module):
         if self.verbose:
             loader = tqdm(loader)
 
-        predictions, logits_list = [], [] 
-        with tr.no_grad():
+        predictions, logits_list = [], []
+        with tr.inference_mode():
             for batch in loader: 
                 
                 lengths = batch["length"]
